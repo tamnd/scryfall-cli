@@ -1,35 +1,82 @@
 // Package scryfall is the library behind the scryfall command line:
-// the HTTP client, request shaping, and the typed data models for scryfall.
+// the HTTP client, request shaping, and the typed data models for the
+// Scryfall MTG card API.
 //
 // The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// User-Agent, paces requests so a busy session stays polite (Scryfall
+// asks for 50-100ms between requests), and retries the transient
+// failures (429 and 5xx) that any public API throws under load.
 package scryfall
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to scryfall. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "scryfall/dev (+https://github.com/tamnd/scryfall-cli)"
+// DefaultUserAgent identifies the client to Scryfall. Scryfall's docs ask for a
+// real, honest User-Agent so they can contact you if something goes wrong.
+const DefaultUserAgent = "scryfall-cli/dev (+https://github.com/tamnd/scryfall-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at scryfall.com; change it once you
-// know the real endpoints you want to read.
-const Host = "scryfall.com"
+// Host is the API host this client talks to, and the host the URI driver in
+// domain.go claims.
+const Host = "api.scryfall.com"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to scryfall over HTTP.
+// Prices holds the market prices for a card in common currencies.
+type Prices struct {
+	USD     string `json:"usd"`
+	USDFoil string `json:"usd_foil"`
+	EUR     string `json:"eur"`
+}
+
+// Card is a single Magic: The Gathering card as returned by the Scryfall API.
+type Card struct {
+	ID          string   `kit:"id" json:"id"`
+	Name        string   `json:"name"`
+	ManaCost    string   `json:"mana_cost"`
+	CMC         float64  `json:"cmc"`
+	TypeLine    string   `json:"type_line"`
+	OracleText  string   `json:"oracle_text"`
+	Power       string   `json:"power"`
+	Toughness   string   `json:"toughness"`
+	Colors      []string `json:"colors"`
+	SetCode     string   `json:"set"`
+	SetName     string   `json:"set_name"`
+	Rarity      string   `json:"rarity"`
+	Prices      Prices   `json:"prices"`
+	ScryfallURL string   `json:"scryfall_uri"`
+	ReleasedAt  string   `json:"released_at"`
+}
+
+// Set is a Magic: The Gathering card set as returned by the Scryfall API.
+type Set struct {
+	Code       string `kit:"id" json:"code"`
+	Name       string `json:"name"`
+	SetType    string `json:"set_type"`
+	ReleasedAt string `json:"released_at"`
+	CardCount  int    `json:"card_count"`
+}
+
+// cardListResponse wraps the paginated list returned by /cards/search.
+type cardListResponse struct {
+	TotalCards int    `json:"total_cards"`
+	HasMore    bool   `json:"has_more"`
+	Data       []Card `json:"data"`
+}
+
+// setListResponse wraps the list returned by /sets.
+type setListResponse struct {
+	Data []Set `json:"data"`
+}
+
+// Client talks to the Scryfall API over HTTPS.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,15 +87,88 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: a 30s timeout, a 100ms
+// minimum gap between requests (Scryfall allows ~10 req/sec), and five retries
+// on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
+		Rate:      100 * time.Millisecond,
 		Retries:   5,
 	}
+}
+
+// SearchCards searches for cards matching query. limit caps the results; the
+// max per_page is 175 (one Scryfall page), so we do not paginate for simplicity.
+func (c *Client) SearchCards(ctx context.Context, query string, limit int) ([]Card, error) {
+	perPage := limit
+	if perPage > 175 {
+		perPage = 175
+	}
+	if perPage < 1 {
+		perPage = 20
+	}
+	u := fmt.Sprintf("%s/cards/search?q=%s&per_page=%d", BaseURL, url.QueryEscape(query), perPage)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp cardListResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode cards: %w", err)
+	}
+	cards := resp.Data
+	if limit > 0 && len(cards) > limit {
+		cards = cards[:limit]
+	}
+	return cards, nil
+}
+
+// GetCardByName fetches a single card by fuzzy name match via /cards/named.
+func (c *Client) GetCardByName(ctx context.Context, name string) (*Card, error) {
+	u := fmt.Sprintf("%s/cards/named?fuzzy=%s", BaseURL, url.QueryEscape(name))
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var card Card
+	if err := json.Unmarshal(body, &card); err != nil {
+		return nil, fmt.Errorf("decode card: %w", err)
+	}
+	return &card, nil
+}
+
+// GetRandomCard fetches a random card from /cards/random.
+func (c *Client) GetRandomCard(ctx context.Context) (*Card, error) {
+	u := BaseURL + "/cards/random"
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var card Card
+	if err := json.Unmarshal(body, &card); err != nil {
+		return nil, fmt.Errorf("decode card: %w", err)
+	}
+	return &card, nil
+}
+
+// ListSets fetches all sets from /sets and returns up to limit results.
+func (c *Client) ListSets(ctx context.Context, limit int) ([]Set, error) {
+	u := BaseURL + "/sets"
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp setListResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode sets: %w", err)
+	}
+	sets := resp.Data
+	if limit > 0 && len(sets) > limit {
+		sets = sets[:limit]
+	}
+	return sets, nil
 }
 
 // Get fetches url and returns the response body. It paces and retries according
@@ -83,6 +203,7 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -121,80 +242,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on scryfall.com. It is a stand-in for the typed records you
-// will model from the real scryfall endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `scryfall cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
